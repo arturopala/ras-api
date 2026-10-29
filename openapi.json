@@ -1,0 +1,937 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Relief at Source API (ras-api)",
+    "version": "2.0",
+    "description": "Backend microservice that returns the income-tax residency status (Scotland, Wales, rest of UK) of pension scheme members, either one at a time through the public API or in bulk from an uploaded CSV. Derived from conf/app.routes, conf/definition.routes and the controllers. On the HMRC API Platform the public endpoint is exposed under the context `individuals/relief-at-source`."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:9669",
+      "description": "Local (see README / service-manager)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Residency status",
+      "description": "Single member residency-status lookup (public API)."
+    },
+    {
+      "name": "Bulk file processing",
+      "description": "Upscan callback that triggers bulk CSV lookups."
+    },
+    {
+      "name": "Results files",
+      "description": "Download and removal of the generated results CSV."
+    },
+    {
+      "name": "File sessions",
+      "description": "Per-organisation file-session tracking used by the RAS frontend."
+    },
+    {
+      "name": "API publishing",
+      "description": "API Platform definition and documentation assets."
+    },
+    {
+      "name": "Platform",
+      "description": "Routes provided by bootstrap-play."
+    }
+  ],
+  "paths": {
+    "/residency-status": {
+      "post": {
+        "tags": [
+          "Residency status"
+        ],
+        "summary": "Look up a member's residency status",
+        "operationId": "getResidencyStatus",
+        "parameters": [
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "description": "Must contain application/vnd.hmrc.1.0+json or application/vnd.hmrc.2.0+json (2.0 only when api-v2_0.enabled).",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "application/vnd.hmrc.2.0+json",
+                "application/vnd.hmrc.1.0+json"
+              ]
+            }
+          }
+        ],
+        "x-downstream": {
+          "service": "des",
+          "method": "POST",
+          "path": "/individuals/residency-status/"
+        },
+        "description": "Proxied to **des** as `POST /individuals/residency-status/`.\n\nAuth: Government Gateway + one of HMRC-PSA-ORG / HMRC-PP-ORG / HMRC-PODS-ORG / HMRC-PODSPP-ORG.\n\nPublic API endpoint, published on the API Platform as `POST /individuals/relief-at-source/residency-status` (OAuth scope `read:ras`). The Accept header is validated before auth. Returns the current-year status; the next-year forecast is included only from 1 January to 5 April. Each outcome is audited as `ReliefAtSourceResidency`.\n\nRequest headers used: `Accept`, `Authorization`, `Content-Type`.",
+        "requestBody": {
+          "required": true,
+          "description": "Member details.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResidencyStatusRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Residency status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResidencyStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BAD_REQUEST: malformed or non-JSON body (no `errors`), or field validation failures (with `errors[]`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestWithErrors"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/ApiUnauthorized"
+          },
+          "403": {
+            "description": "STATUS_UNAVAILABLE: member not matched or deceased (same response for both).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "code": "STATUS_UNAVAILABLE",
+                  "message": "Cannot provide a residency status for this pension scheme member."
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "ACCEPT_HEADER_INVALID: Accept header missing, or version not allowed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "code": "ACCEPT_HEADER_INVALID",
+                  "message": "The accept header is missing or invalid"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "DES reported TOO_MANY_REQUESTS (body code or 429). The explicitly imported `errorResponseWrites` (Writes[ErrorResponse]) is in lexical scope, so under Scala 3 implicit resolution it is chosen over the companion `TooManyRequestsResponse.writes`; no controller test pins the body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "code": "TOO_MANY_REQUESTS",
+                  "message": "Request could not be sent 429 (Too Many Requests) was sent from the HoD."
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "INTERNAL_SERVER_ERROR: unknown DES code, missing next-year status (unless toggled), DES 400/timeout/unparseable body, unexpected auth error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "SERVER_ERROR: DES reported SERVICE_UNAVAILABLE (body code or 503).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "code": "SERVER_ERROR",
+                  "message": "Service unavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ras-api/file-processing/status/{userId}": {
+      "post": {
+        "tags": [
+          "Bulk file processing"
+        ],
+        "summary": "Upscan upload-status callback",
+        "operationId": "statusCallback",
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Pension scheme organisation ID the upload belongs to; not validated or authenticated."
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "2.0"
+            },
+            "description": "API version used for the bulk lookups: 1.0 or 2.0; anything else is 400."
+          }
+        ],
+        "description": "Auth: None (unauthenticated).\n\nCalled by Upscan. On READY with a downloadUrl, the file is downloaded and processed asynchronously and the session is updated; on FAILED the session is updated. Always 200 once the request is accepted; processing failures are not reported to the caller.",
+        "requestBody": {
+          "required": true,
+          "description": "Upscan callback payload.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpscanCallback"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Callback accepted (empty body)."
+          },
+          "400": {
+            "description": "Unsupported version, missing/non-JSON body or malformed JSON (empty body, or BAD_REQUEST JSON from the body parser)."
+          },
+          "500": {
+            "description": "JSON that does not match the callback shape: `Success(JsError)` is not matched in withValidJson, so a MatchError is thrown and mapped to INTERNAL_SERVER_ERROR.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ras-api/file/getFile/{name}": {
+      "get": {
+        "tags": [
+          "Results files"
+        ],
+        "summary": "Download a results CSV",
+        "operationId": "serveFile",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Results file name (the Upscan reference)."
+          }
+        ],
+        "description": "Auth: Government Gateway + pension enrolment (as lookup).\n\nStreams the GridFS file with this filename as `application/csv`, with `Content-Disposition: attachment; filename=\"<name>\"`. The lookup uses only the filename; the file's owner is not checked.\n\nRequest headers used: `Authorization`.",
+        "responses": {
+          "200": {
+            "description": "Results CSV stream.",
+            "content": {
+              "application/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/ApiUnauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundJson"
+          },
+          "500": {
+            "description": "Repository failure (empty body) or unexpected auth error (INTERNAL_SERVER_ERROR JSON)."
+          }
+        }
+      }
+    },
+    "/ras-api/file/remove/{name}/{userid}": {
+      "delete": {
+        "tags": [
+          "Results files"
+        ],
+        "summary": "Delete a results CSV",
+        "operationId": "removeFile",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Results file name."
+          },
+          {
+            "name": "userid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Ignored."
+          }
+        ],
+        "description": "Auth: Government Gateway + pension enrolment (as lookup).\n\nRemoves the GridFS file, then tries to remove chunks with `files_id = name` when name parses as an ObjectId. Audited as `FileDeletion`. The `userid` path segment is ignored; the authenticated ID is used instead.\n\nRequest headers used: `Authorization`.",
+        "responses": {
+          "200": {
+            "description": "File removed (empty body)."
+          },
+          "401": {
+            "$ref": "#/components/responses/ApiUnauthorized"
+          },
+          "500": {
+            "description": "File not removed or repository failure (empty body), or unexpected auth error (INTERNAL_SERVER_ERROR JSON)."
+          }
+        }
+      }
+    },
+    "/create-file-session": {
+      "post": {
+        "tags": [
+          "File sessions"
+        ],
+        "summary": "Create a file session for an upload",
+        "operationId": "createFileSession",
+        "description": "Auth: Government Gateway + pension enrolment.\n\nCreates (or replaces) the session keyed by the body's userId.\n\nRequest headers used: `Authorization`.",
+        "requestBody": {
+          "required": true,
+          "description": "Session to create.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFileSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Session created (empty body)."
+          },
+          "400": {
+            "description": "Plain text: `Missing or invalid json body`, `Json could not be parsed. Errors: \u2026`; or BAD_REQUEST JSON for malformed JSON from the body parser.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/SessionUnauthorized"
+          },
+          "500": {
+            "description": "Plain text when the session could not be stored; INTERNAL_SERVER_ERROR JSON for a non-authorisation auth failure or repository exception.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/get-file-session/{userId}": {
+      "get": {
+        "tags": [
+          "File sessions"
+        ],
+        "summary": "Fetch the caller's file session",
+        "operationId": "fetchFileSession",
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Must equal the authenticated organisation ID."
+          }
+        ],
+        "description": "Auth: Government Gateway + pension enrolment; path userId must equal the enrolment identifier.\n\nRequest headers used: `Authorization`.",
+        "responses": {
+          "200": {
+            "description": "File session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileSession"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/UserIdMismatch"
+          },
+          "401": {
+            "$ref": "#/components/responses/SessionUnauthorized"
+          },
+          "404": {
+            "description": "Plain text: `Could not find file session for user: \u2026`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/delete-file-session/{userId}": {
+      "delete": {
+        "tags": [
+          "File sessions"
+        ],
+        "summary": "Delete the caller's file session",
+        "operationId": "deleteFileSession",
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Must equal the authenticated organisation ID."
+          }
+        ],
+        "description": "Auth: Government Gateway + pension enrolment; path userId must equal the enrolment identifier.\n\nRequest headers used: `Authorization`.",
+        "responses": {
+          "204": {
+            "description": "Session deleted."
+          },
+          "400": {
+            "$ref": "#/components/responses/UserIdMismatch"
+          },
+          "401": {
+            "$ref": "#/components/responses/SessionUnauthorized"
+          },
+          "500": {
+            "description": "Plain text `Delete operation failed`, or INTERNAL_SERVER_ERROR JSON for an unexpected failure.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/definition": {
+      "get": {
+        "tags": [
+          "API publishing"
+        ],
+        "summary": "API Platform definition",
+        "operationId": "definition",
+        "description": "Auth: None.\n\nContext from `api.context`; version statuses from `api.versions.*.status`; endpointsEnabled from `api.endpointsEnabled` (v1.0) and `api-v2_0.enabled` (v2.0). Rendered by a .txt template, so the response Content-Type is text/plain although the body is JSON.",
+        "responses": {
+          "200": {
+            "description": "API definition.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiDefinition"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/documentation/{version}/{endpointName}": {
+      "get": {
+        "tags": [
+          "API publishing"
+        ],
+        "summary": "Endpoint XML documentation (legacy)",
+        "operationId": "documentation",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointName",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Auth: None.\n\nServes `/public/api/documentation/<version>/<endpointName with spaces as ->.xml` from the classpath. No such directory is bundled, so this always returns 404.",
+        "responses": {
+          "200": {
+            "description": "XML asset (theoretical: no assets are bundled)."
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundJson"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/conf/{version}/{file}": {
+      "get": {
+        "tags": [
+          "API publishing"
+        ],
+        "summary": "Published OpenAPI spec and docs",
+        "operationId": "specification",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "file",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "allowReserved": true,
+            "description": "Asset path below the version directory."
+          }
+        ],
+        "description": "Auth: None.\n\nServes files from `/public/api/conf/<version>/` (e.g. `2.0/application.yaml`, `common/overview.md`) via Play Assets.",
+        "responses": {
+          "200": {
+            "description": "Asset contents."
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundJson"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/ping/ping": {
+      "get": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Health check (bootstrap health.Routes)",
+        "operationId": "ping",
+        "responses": {
+          "200": {
+            "description": "Service is up (empty body)."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "ValidationError": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "INVALID_FORMAT",
+              "INVALID_DATA_TYPE",
+              "MISSING_FIELD",
+              "INVALID_DATE"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "nullable": true,
+            "example": "/nino"
+          }
+        }
+      },
+      "BadRequestWithErrors": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "BAD_REQUEST"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "example": "Bad Request"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            }
+          }
+        }
+      },
+      "ResidencyStatusRequest": {
+        "type": "object",
+        "required": [
+          "nino",
+          "firstName",
+          "lastName",
+          "dateOfBirth"
+        ],
+        "description": "Read by IndividualDetails.individualDetailsReads. Unknown fields are ignored. nino is upper-cased and padded to 9 characters; names are upper-cased.",
+        "properties": {
+          "nino": {
+            "type": "string",
+            "pattern": "^((?!(BG|GB|KN|NK|NT|TN|ZZ)|(D|F|I|Q|U|V)[A-Z]|[A-Z](D|F|I|O|Q|U|V))[A-Z]{2})[0-9]{6}[A-D]?$",
+            "description": "Matched case-insensitively (upper-cased before the regex)."
+          },
+          "firstName": {
+            "type": "string",
+            "pattern": "^[a-zA-Z &`\\-'^]{1,35}$"
+          },
+          "lastName": {
+            "type": "string",
+            "pattern": "^[a-zA-Z &`\\-'^]{1,35}$"
+          },
+          "dateOfBirth": {
+            "type": "string",
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Strict uuuu-MM-dd, not after today."
+          }
+        }
+      },
+      "ResidencyStatus": {
+        "type": "object",
+        "required": [
+          "currentYearResidencyStatus"
+        ],
+        "properties": {
+          "currentYearResidencyStatus": {
+            "type": "string",
+            "enum": [
+              "scotResident",
+              "welshResident",
+              "otherUKResident"
+            ],
+            "description": "v1.0 reports Welsh residents as otherUKResident. Values are mapped from DES by substring replacement, so an unexpected DES value can pass through outside this enum."
+          },
+          "nextYearForecastResidencyStatus": {
+            "type": "string",
+            "enum": [
+              "scotResident",
+              "welshResident",
+              "otherUKResident"
+            ],
+            "description": "Only returned between 1 January and 5 April."
+          }
+        }
+      },
+      "UpscanCallback": {
+        "type": "object",
+        "required": [
+          "reference",
+          "fileStatus"
+        ],
+        "description": "Json.format[UpscanCallbackData]; shape only, no value checks.",
+        "properties": {
+          "reference": {
+            "type": "string"
+          },
+          "downloadUrl": {
+            "type": "string"
+          },
+          "fileStatus": {
+            "type": "string",
+            "description": "READY and FAILED are acted on; any other value is logged and ignored."
+          },
+          "uploadDetails": {
+            "type": "object",
+            "required": [
+              "uploadTimestamp",
+              "checksum",
+              "fileMimeType",
+              "fileName",
+              "size"
+            ],
+            "properties": {
+              "uploadTimestamp": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "checksum": {
+                "type": "string"
+              },
+              "fileMimeType": {
+                "type": "string"
+              },
+              "fileName": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer",
+                "format": "int32"
+              }
+            }
+          },
+          "failureDetails": {
+            "type": "object",
+            "required": [
+              "failureReason",
+              "message"
+            ],
+            "properties": {
+              "failureReason": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "CreateFileSessionRequest": {
+        "type": "object",
+        "required": [
+          "userId",
+          "reference"
+        ],
+        "description": "Both fields must be non-empty strings. userId is NOT compared with the authenticated organisation ID; reference is not stored.",
+        "properties": {
+          "userId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reference": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "FileSession": {
+        "type": "object",
+        "required": [
+          "userId"
+        ],
+        "properties": {
+          "userFile": {
+            "$ref": "#/components/schemas/UpscanCallback"
+          },
+          "resultsFile": {
+            "type": "object",
+            "required": [
+              "id",
+              "filename",
+              "uploadDate",
+              "chunkSize",
+              "length"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "filename": {
+                "type": "string"
+              },
+              "uploadDate": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "chunkSize": {
+                "type": "integer",
+                "format": "int32"
+              },
+              "length": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          "userId": {
+            "type": "string"
+          },
+          "uploadTimeStamp": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "fileMetadata": {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "created": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ApiDefinition": {
+        "type": "object",
+        "description": "Rendered from the definition.scala.txt template with api.context and version statuses from config.",
+        "properties": {
+          "api": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "responses": {
+      "InternalServerError": {
+        "description": "Unexpected failure (unhandled exception mapped by RasErrorHandler.onServerError).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": "INTERNAL_SERVER_ERROR",
+              "message": "Internal server error"
+            }
+          }
+        }
+      },
+      "MalformedJson": {
+        "description": "Malformed JSON with a JSON Content-Type, rejected by the body parser before the controller (RasErrorHandler.onClientError).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": "BAD_REQUEST",
+              "message": "Bad Request"
+            }
+          }
+        }
+      },
+      "ApiUnauthorized": {
+        "description": "UNAUTHORIZED (InsufficientEnrolments) or INVALID_CREDENTIALS (NoActiveSession).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "SessionUnauthorized": {
+        "description": "Any AuthorisationException; body is the exception message as plain text.",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "NotFoundJson": {
+        "description": "Resource not found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": "NOT_FOUND",
+              "message": "Resource Not Found"
+            }
+          }
+        }
+      },
+      "UserIdMismatch": {
+        "description": "Path userId differs from the authenticated organisation ID (plain text).",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

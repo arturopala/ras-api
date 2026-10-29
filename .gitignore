@@ -29,3 +29,5 @@ test-result
 tmp
 .idea_modules
 bin
+.metals/
+.vscode/
